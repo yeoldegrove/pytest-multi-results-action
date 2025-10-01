@@ -17,3 +17,7 @@ runs:
     - name: Setup Python virtual environment
       shell: bash
       run: uv venv
+
+    - name: Install python dependencies
+      shell: bash
+      run: pip install -r requirements.txt

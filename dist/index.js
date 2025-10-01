@@ -7291,6 +7291,7 @@ exports["default"] = _default;
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const fs = (__nccwpck_require__(7147).promises);
+const path = __nccwpck_require__(1017);
 
 const core = __nccwpck_require__(2186);
 const glob = __nccwpck_require__(8090);
@@ -7299,41 +7300,145 @@ const { XMLParser } = __nccwpck_require__(2603);
 
 module.exports = { parseXmlFiles };
 
-async function* collectXmlFiles(path) {
-  const globber = await glob.create(path, {
-    implicitDescendants: false,
-  });
-  const paths = await globber.glob();
+async function* collectXmlFiles(paths) {
+  // Handle both single path (legacy) and multiple paths (new)
+  const pathArray = Array.isArray(paths) ? paths : [paths];
 
-  for (const file_or_dir of paths) {
-    var stats;
-    try {
-      stats = await fs.stat(file_or_dir);
-    } catch (error) {
-      core.setFailed(`Action failed with error ${error}`);
-    }
-    if (stats.isFile()) {
-      yield file_or_dir;
-    } else {
-      const globber = await glob.create(file_or_dir + "/**/*.xml", {
-        implicitDescendants: false,
-      });
-      for await (const file of globber.glob()) {
-        yield file;
+  for (const path of pathArray) {
+    if (!path) continue; // Skip empty paths
+
+    const globber = await glob.create(path, {
+      implicitDescendants: false,
+    });
+    const foundPaths = await globber.glob();
+
+    for (const file_or_dir of foundPaths) {
+      var stats;
+      try {
+        stats = await fs.stat(file_or_dir);
+      } catch (error) {
+        core.setFailed(`Action failed with error ${error}`);
+      }
+      if (stats.isFile()) {
+        yield file_or_dir;
+      } else {
+        const globber = await glob.create(file_or_dir + "/**/*.xml", {
+          implicitDescendants: false,
+        });
+        for await (const file of globber.glob()) {
+          yield file;
+        }
       }
     }
   }
 }
 
-async function* parseXmlFiles(path) {
+async function* parseXmlFiles(paths) {
   const parser = new XMLParser({
     ignoreAttributes: false,
     processEntities: false,
+    attributeNamePrefix: "@_",
   });
 
-  for await (const file of collectXmlFiles(path)) {
-    yield parser.parse(await fs.readFile(file, "utf-8"));
+  for await (const file of collectXmlFiles(paths)) {
+    try {
+      const xmlContent = await fs.readFile(file, "utf-8");
+
+      // Handle empty files by creating a mock result
+      if (!xmlContent.trim()) {
+        console.warn(`Skipping empty file: ${file}`);
+        const emptyFileResult = {
+          testsuites: {
+            testsuite: {
+              "@_name": "empty-file",
+              "@_tests": "0",
+              "@_errors": "1",
+              "@_failures": "0",
+              "@_skipped": "0",
+              "@_time": "0.0",
+              testcase: {
+                "@_name": "empty-file-error",
+                "@_classname": "ParsingError",
+                error: {
+                  "#text": "Skipping empty file",
+                },
+              },
+            },
+          },
+        };
+        emptyFileResult._filePath = file;
+        emptyFileResult._metadata = extractMetadata(emptyFileResult, file);
+        yield emptyFileResult;
+        continue;
+      }
+
+      const parsedXml = parser.parse(xmlContent);
+
+      // Add file path to the parsed XML for later use
+      parsedXml._filePath = file;
+      parsedXml._metadata = extractMetadata(parsedXml, file);
+
+      yield parsedXml;
+    } catch (error) {
+      console.error(`Error parsing XML file ${file}: ${error.message}`);
+      // Continue processing other files instead of failing completely
+      continue;
+    }
   }
+}
+
+function extractMetadata(parsedXml, filepath) {
+  const metadata = {};
+
+  // Extract metadata from testsuite attributes if available
+  if (parsedXml.testsuites && parsedXml.testsuites.testsuite) {
+    const testsuite = parsedXml.testsuites.testsuite;
+
+    // Extract pytest-metadata properties
+    if (testsuite.properties && testsuite.properties.property) {
+      const properties = Array.isArray(testsuite.properties.property)
+        ? testsuite.properties.property
+        : [testsuite.properties.property];
+
+      properties.forEach((prop) => {
+        const name = prop["@_name"];
+        const value = prop["@_value"];
+        if (name && value) {
+          metadata[name] = value;
+        }
+      });
+    }
+
+    // Extract any other custom attributes
+    Object.keys(testsuite).forEach((key) => {
+      if (
+        key.startsWith("@_") &&
+        ![
+          "@_name",
+          "@_errors",
+          "@_failures",
+          "@_skipped",
+          "@_tests",
+          "@_time",
+          "@_timestamp",
+          "@_hostname",
+        ].includes(key)
+      ) {
+        const fieldName = key.substring(2); // Remove @_ prefix
+        metadata[fieldName] = testsuite[key];
+      }
+    });
+  }
+
+  // If no metadata was found, use filename as fallback
+  if (Object.keys(metadata).length === 0) {
+    const basename = path.basename(filepath);
+    metadata["Suite"] = basename;
+    // Mark this as a metadata parsing error
+    metadata["_metadata_parsing_error"] = true;
+  }
+
+  return metadata;
 }
 
 
@@ -7350,7 +7455,10 @@ const { parseXmlFiles } = __nccwpck_require__(8693);
 const { postResults } = __nccwpck_require__(3188);
 
 async function main(inputs) {
-  var xmls = parseXmlFiles(inputs.path);
+  // Use files input
+  const paths = inputs.files;
+
+  var xmls = parseXmlFiles(paths);
 
   const { isEmpty, generator } = await checkAsyncGeneratorEmpty(xmls);
   if (isEmpty && inputs.failOnEmpty) {
@@ -7360,7 +7468,16 @@ async function main(inputs) {
   }
   xmls = generator;
 
-  await postResults(xmls, inputs);
+  await postResults(
+    xmls,
+    inputs.title,
+    inputs.summary,
+    inputs.metadataFields,
+    inputs.metadataFieldMapping,
+    inputs.resultTypes,
+    inputs.details,
+    inputs.detailsResultTypes
+  );
 }
 
 
@@ -7386,99 +7503,307 @@ const resultTypes = [
   "xpassed",
   "error",
 ];
-const resultTypesWithEmoji = zip(
-  resultTypes,
-  ["green", "yellow", "yellow", "red", "red", "red"].map(
-    (color) => `:${color}_circle:`
-  )
-);
+const typeToEmoji = {
+  passed: "🟢",
+  skipped: "🟡",
+  xfailed: "🟡",
+  failed: "🔴",
+  xpassed: "🔴",
+  error: "🔴",
+};
 
-async function postResults(xmls, inputs) {
+function slugify(text) {
+  return String(text)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+async function postResults(
+  xmls,
+  title,
+  summary,
+  metadataFields,
+  metadataFieldMapping,
+  resultTypesInput,
+  details,
+  detailsResultTypesInput
+) {
   const results = await extractResults(xmls);
   if (results.total_tests == 0) {
     return;
   }
 
-  addResults(results, inputs.title, inputs.summary, inputs.displayOptions);
+  // Parse result types input or use defaults
+  let selectedResultTypes = (resultTypesInput || "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => !!t);
+  const allowed = new Set(resultTypes);
+  selectedResultTypes = selectedResultTypes.filter((t) => allowed.has(t));
+  if (!selectedResultTypes.length) {
+    selectedResultTypes = [...resultTypes];
+  }
+
+  addResults(
+    results,
+    title,
+    summary,
+    metadataFields,
+    metadataFieldMapping,
+    selectedResultTypes,
+    details,
+    detailsResultTypesInput
+  );
   await gha.summary.write();
 }
 
 async function extractResults(xmls) {
-  const results = {
-    total_time: 0.0,
-    total_tests: 0,
-    // FIXME: incorporate from above
-    passed: [],
-    failed: [],
-    skipped: [],
-    xfailed: [],
-    xpassed: [],
-    error: [],
+  const multiSuiteResults = {
+    suites: {},
+    aggregated: {
+      total_time: 0.0,
+      total_tests: 0,
+      passed: [],
+      failed: [],
+      skipped: [],
+      xfailed: [],
+      xpassed: [],
+      error: [],
+    },
   };
 
   for await (const xml of xmls) {
+    const metadata = xml._metadata || {};
+    const filePath = xml._filePath || "unknown";
+
+    // Create a meaningful suite identifier
+    // Use filename as suite name (ending in *.xml)
+    const fileName = filePath.split("/").pop() || "unknown";
+    const suiteName = fileName;
+
+    // Initialize suite if not exists
+    if (!multiSuiteResults.suites[suiteName]) {
+      multiSuiteResults.suites[suiteName] = {
+        name: suiteName,
+        filePath: filePath,
+        total_time: 0.0,
+        total_tests: 0,
+        passed: [],
+        failed: [],
+        skipped: [],
+        xfailed: [],
+        xpassed: [],
+        error: [],
+        metadata: xml._metadata || {},
+      };
+    }
+
+    // Check if testsuites exists and has testsuite
+    if (!xml.testsuites || !xml.testsuites.testsuite) {
+      console.warn(
+        `Skipping file ${filePath}: Invalid XML structure - missing testsuites or testsuite`
+      );
+      continue;
+    }
+
     var testSuites = xml.testsuites.testsuite;
     testSuites = testSuites instanceof Array ? testSuites : [testSuites];
 
     for (var testSuite of testSuites) {
-      results.total_time += parseFloat(testSuite["@_time"]);
+      const suiteTime = parseFloat(testSuite["@_time"]);
+      multiSuiteResults.suites[suiteName].total_time += suiteTime;
+      multiSuiteResults.aggregated.total_time += suiteTime;
 
       var testCases = testSuite.testcase;
       if (!testCases) {
         continue;
       }
       testCases = testCases instanceof Array ? testCases : [testCases];
+
       for (const result of testCases) {
         var resultTypeArray;
+        var aggregatedResultTypeArray;
         var msg;
 
         if (Object.hasOwn(result, "failure")) {
           var msg = result.failure["#text"];
           const parts = msg.split("[XPASS(strict)] ");
           if (parts.length == 2) {
-            resultTypeArray = results.xpassed;
+            resultTypeArray = multiSuiteResults.suites[suiteName].xpassed;
+            aggregatedResultTypeArray = multiSuiteResults.aggregated.xpassed;
             msg = parts[1];
           } else {
-            resultTypeArray = results.failed;
+            resultTypeArray = multiSuiteResults.suites[suiteName].failed;
+            aggregatedResultTypeArray = multiSuiteResults.aggregated.failed;
           }
         } else if (Object.hasOwn(result, "skipped")) {
           if (result.skipped["@_type"] == "pytest.xfail") {
-            resultTypeArray = results.xfailed;
+            resultTypeArray = multiSuiteResults.suites[suiteName].xfailed;
+            aggregatedResultTypeArray = multiSuiteResults.aggregated.xfailed;
           } else {
-            resultTypeArray = results.skipped;
+            resultTypeArray = multiSuiteResults.suites[suiteName].skipped;
+            aggregatedResultTypeArray = multiSuiteResults.aggregated.skipped;
           }
           msg = result.skipped["@_message"];
         } else if (Object.hasOwn(result, "error")) {
-          resultTypeArray = results.error;
-          // FIXME: do we need to integrate the message here?
+          resultTypeArray = multiSuiteResults.suites[suiteName].error;
+          aggregatedResultTypeArray = multiSuiteResults.aggregated.error;
           msg = result.error["#text"];
         } else {
-          // This could also be an xpass when strict=False is set. Unfortunately, there is no way to differentiate here
-          // See FIXME
-          resultTypeArray = results.passed;
+          resultTypeArray = multiSuiteResults.suites[suiteName].passed;
+          aggregatedResultTypeArray = multiSuiteResults.aggregated.passed;
           msg = undefined;
         }
 
-        resultTypeArray.push({
+        const testResult = {
           id: result["@_classname"] + "." + result["@_name"],
           msg: msg,
-        });
-        results.total_tests += 1;
+          suite: suiteName,
+        };
+
+        resultTypeArray.push(testResult);
+        aggregatedResultTypeArray.push(testResult);
+
+        multiSuiteResults.suites[suiteName].total_tests += 1;
+        multiSuiteResults.aggregated.total_tests += 1;
       }
     }
   }
 
-  return results;
-}
-
-async function addResults(results, title, summary, displayOptions) {
-  gha.summary.addHeading(title);
-
-  if (summary) {
-    addSummary(results);
+  // Add metadata parsing errors for suites that couldn't parse metadata
+  for (const [suiteName, suiteResults] of Object.entries(
+    multiSuiteResults.suites
+  )) {
+    if (
+      suiteResults.metadata &&
+      suiteResults.metadata._metadata_parsing_error
+    ) {
+      // Add a metadata parsing error
+      const metadataError = {
+        id: "ParsingError.metadata-parsing-error",
+        msg: "Metadata could not be parsed from XML file",
+      };
+      suiteResults.error.push(metadataError);
+      multiSuiteResults.aggregated.error.push(metadataError);
+      suiteResults.total_tests += 1;
+      multiSuiteResults.aggregated.total_tests += 1;
+    }
   }
 
-  for (resultType of getResultTypesFromDisplayOptions(displayOptions)) {
+  // Always return the full multiSuiteResults to preserve suites and metadata
+  return multiSuiteResults;
+}
+
+async function addResults(
+  results,
+  title,
+  summary,
+  metadataFields,
+  metadataFieldMapping,
+  selectedResultTypes,
+  details,
+  detailsResultTypesInput
+) {
+  gha.summary.addHeading(title);
+
+  // Check if we have suite results (single or multi-suite)
+  if (results.suites && Object.keys(results.suites).length > 0) {
+    addMultiSuiteResults(
+      results,
+      summary,
+      metadataFields,
+      metadataFieldMapping,
+      selectedResultTypes,
+      details,
+      detailsResultTypesInput
+    );
+  } else {
+    // No suites found, use aggregated results (backward compatibility)
+    const singleResults = results.aggregated || results;
+    addSingleSuiteResults(singleResults, summary, selectedResultTypes);
+  }
+}
+
+function addMultiSuiteResults(
+  results,
+  summary,
+  metadataFields,
+  metadataFieldMapping,
+  selectedResultTypes,
+  details,
+  detailsResultTypesInput
+) {
+  if (summary) {
+    // Test summary section
+    gha.summary.addHeading("Test Summary", 2);
+    addOverallSummary(results.aggregated, selectedResultTypes);
+
+    // Test results (per-suite table) section
+    gha.summary.addHeading("Test Results", 2);
+    // parse details-result-types input (default failed,error)
+    let detailedResultTypesForLinks = (
+      detailsResultTypesInput || "failed,error"
+    )
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => !!t);
+    const allowedForLinks = new Set(resultTypes);
+    detailedResultTypesForLinks = detailedResultTypesForLinks.filter((t) =>
+      allowedForLinks.has(t)
+    );
+    if (!detailedResultTypesForLinks.length) {
+      detailedResultTypesForLinks = ["failed", "error"];
+    }
+
+    addSuiteTable(
+      results.suites,
+      metadataFields,
+      metadataFieldMapping,
+      selectedResultTypes,
+      detailedResultTypesForLinks
+    );
+  }
+
+  // Add errors/failures result details for each suite (only if any exist)
+  const detailsEnabled = details !== false; // default true
+
+  // parse details-result-types input (default failed,error)
+  let detailedResultTypes = (detailsResultTypesInput || "failed,error")
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => !!t);
+  const allowed = new Set(resultTypes);
+  detailedResultTypes = detailedResultTypes.filter((t) => allowed.has(t));
+  if (!detailedResultTypes.length) {
+    detailedResultTypes = ["failed", "error"];
+  }
+
+  const hasAnyIssues = Object.values(results.suites).some((suiteResults) =>
+    hasRelevantResults(suiteResults, detailedResultTypes)
+  );
+  if (detailsEnabled && hasAnyIssues) {
+    gha.summary.addHeading("Test Details", 2);
+    for (const [suiteName, suiteResults] of Object.entries(results.suites)) {
+      if (hasRelevantResults(suiteResults, detailedResultTypes)) {
+        const suiteSlug = slugify(suiteName);
+        gha.summary.addRaw(`<a id="suite-${suiteSlug}"></a>`, true);
+        gha.summary.addRaw("\n\n---\n\n", true);
+        gha.summary.addHeading(`${suiteName} Details`, 3);
+        addSuiteDetails(suiteName, suiteResults, detailedResultTypes);
+      }
+    }
+  }
+}
+
+function addSingleSuiteResults(results, summary, selectedResultTypes) {
+  if (summary) {
+    addSummary(results, selectedResultTypes);
+  }
+
+  for (resultType of selectedResultTypes) {
     const results_for_type = results[resultType];
     if (!results_for_type.length) {
       continue;
@@ -7494,20 +7819,24 @@ async function addResults(results, title, summary, displayOptions) {
           result.msg
         );
       } else {
-        gha.summary.addRaw(`\n:heavy_check_mark: ${result.id}`, true);
+        gha.summary.addDetails(
+          gha.summary.wrap("code", result.id),
+          "\n\n:heavy_check_mark: Passed"
+        );
       }
     }
   }
 }
 
-function addSummary(results) {
+function addOverallSummary(results, selectedResultTypes) {
   gha.summary.addRaw(
     `Ran ${results.total_tests} tests in ${prettyDuration(results.total_time)}`,
     true
   );
 
   var rows = [["Result", "Amount"]];
-  for (const [resultType, emoji] of resultTypesWithEmoji) {
+  for (const resultType of selectedResultTypes) {
+    const emoji = typeToEmoji[resultType];
     const abs_amount = results[resultType].length;
     const rel_amount = abs_amount / results.total_tests;
     rows.push([
@@ -7518,33 +7847,189 @@ function addSummary(results) {
   gha.summary.addTable(rows);
 }
 
-function getResultTypesFromDisplayOptions(displayOptions) {
-  // 'N' resets the list of chars passed to the '-r' option of pytest. Thus, we only
-  // care about anything after the last occurrence
-  const displayChars = displayOptions.split("N").pop();
+function addSuiteTable(
+  suites,
+  metadataFields,
+  metadataFieldMapping,
+  selectedResultTypes,
+  detailedResultTypesForLinks
+) {
+  // Parse metadata field mapping
+  const fieldMapping = metadataFieldMapping
+    ? JSON.parse(metadataFieldMapping)
+    : {};
 
-  console.log(displayChars);
+  // Use Suite as fallback if no metadata fields provided, otherwise use the order from metadata-fields input
+  const fieldsToShow = metadataFields
+    ? metadataFields.split(",").map((f) => f.trim())
+    : ["Suite"];
 
-  if (displayChars.toLowerCase().includes("a")) {
-    return resultTypes;
+  // Build header row using the order of fields as provided
+  const headerRow = [];
+
+  // Determine columns strictly from selected result types
+
+  // Add metadata columns in the order they were provided
+  fieldsToShow.forEach((field) => {
+    const displayName =
+      fieldMapping[field] ||
+      field.replace("-", " ").replace(/\b\w/g, (l) => l.toUpperCase());
+    headerRow.push(displayName);
+  });
+
+  // Add test statistics columns with emojis
+  headerRow.push("Total");
+  for (const t of selectedResultTypes) {
+    const emoji = typeToEmoji[t];
+    const label = `${emoji} ${t.charAt(0).toUpperCase()}${t.slice(1)}`;
+    headerRow.push(label);
+  }
+  headerRow.push("Duration");
+
+  const suiteRows = [headerRow];
+
+  for (const [suiteName, suiteResults] of Object.entries(suites)) {
+    const row = [];
+    const suiteSlug = slugify(suiteName);
+
+    // Check if this row has errors or failures
+    const hasErrors = suiteResults.error && suiteResults.error.length > 0;
+    const hasFailures = suiteResults.failed && suiteResults.failed.length > 0;
+    const hasIssues = hasErrors || hasFailures;
+
+    // Add metadata values in the order they were provided (no links)
+    fieldsToShow.forEach((field, index) => {
+      const metadata = suiteResults.metadata || {};
+      let text;
+
+      // For Suite field, use the suite name as fallback
+      if (field === "Suite") {
+        text = metadata[field] || suiteName;
+      } else {
+        text = metadata[field];
+        // If the field doesn't exist, is empty, or is invalid and this is the first column, use the suite name as fallback
+        if (
+          (!text ||
+            text === "-" ||
+            text === "" ||
+            text === null ||
+            text === undefined) &&
+          index === 0
+        ) {
+          text = suiteName;
+        } else {
+          text = text || "-";
+        }
+      }
+
+      // Add emoji indicator to the first column for rows with issues
+      if (index === 0) {
+        const indicator = hasIssues ? "🔴 " : "🟢 ";
+        row.push(indicator + text);
+      } else {
+        row.push(text);
+      }
+    });
+
+    // Add test statistics - ensure all values are properly formatted
+    const totalStr = String(suiteResults.total_tests || 0);
+    const countsByType = {
+      passed: String(suiteResults.passed.length || 0),
+      skipped: String(suiteResults.skipped.length || 0),
+      xfailed: String(suiteResults.xfailed.length || 0),
+      failed: String(suiteResults.failed.length || 0),
+      xpassed: String(suiteResults.xpassed.length || 0),
+      error: String(suiteResults.error.length || 0),
+    };
+    const durationStr = prettyDuration(suiteResults.total_time);
+
+    // Total column (no link)
+    row.push(totalStr);
+    for (const t of selectedResultTypes) {
+      const text = countsByType[t];
+      const count = parseInt(text) || 0;
+      // Only link if count > 0 and type is in detailed result types
+      if (count > 0 && detailedResultTypesForLinks.includes(t)) {
+        row.push(`<a href="#suite-${suiteSlug}-${t}">${text}</a>`);
+      } else {
+        row.push(text);
+      }
+    }
+    row.push(durationStr);
+
+    suiteRows.push(row);
   }
 
-  var displayTypes = new Set();
-  for (const [displayChar, displayType] of [
-    ["f", "failed"],
-    ["E", "error"],
-    ["s", "skipped"],
-    ["x", "xfailed"],
-    ["X", "xpassed"],
-    ["p", "passed"],
-    ["P", "passed"],
-  ]) {
-    if (displayOptions.includes(displayChar)) {
-      displayTypes.add(displayType);
+  gha.summary.addTable(suiteRows);
+}
+
+function addSuiteDetails(suiteName, suiteResults, detailedResultTypes) {
+  for (resultType of detailedResultTypes) {
+    const results_for_type = suiteResults[resultType];
+    if (!results_for_type.length) {
+      continue;
+    }
+
+    const suiteSlug = slugify(suiteName);
+    gha.summary.addRaw(`<a id="suite-${suiteSlug}-${resultType}"></a>`, true);
+    gha.summary.addHeading(resultType, 4);
+
+    // Limit to 10 results and show overflow message if needed
+    const maxResults = 10;
+    const resultsToShow = results_for_type.slice(0, maxResults);
+    const hasMore = results_for_type.length > maxResults;
+
+    for (const result of resultsToShow) {
+      if (result.msg) {
+        addDetailsWithCodeBlock(
+          gha.summary,
+          gha.summary.wrap("code", result.id),
+          result.msg
+        );
+      } else {
+        gha.summary.addDetails(
+          gha.summary.wrap("code", result.id),
+          "\n\n:heavy_check_mark: Passed"
+        );
+      }
+    }
+
+    // Show overflow message if there are more results
+    if (hasMore) {
+      const remainingCount = results_for_type.length - maxResults;
+      gha.summary.addRaw(
+        `\n\n> **Note:** ${remainingCount} more ${resultType} result(s) not shown. See full report in artifacts for complete details.`,
+        true
+      );
     }
   }
+}
 
-  return [...displayTypes];
+function hasRelevantResults(suiteResults, detailedResultTypes) {
+  return detailedResultTypes.some(
+    (type) => suiteResults[type] && suiteResults[type].length > 0
+  );
+}
+
+function addSummary(results, selectedResultTypes) {
+  gha.summary.addRaw(
+    `Ran ${results.total_tests} tests in ${prettyDuration(results.total_time)}`,
+    true
+  );
+
+  var rows = [["Result", "Amount"]];
+  for (const resultType of selectedResultTypes) {
+    const emoji = typeToEmoji[resultType];
+    const abs_amount = results[resultType].length;
+    const rel_amount = results.total_tests
+      ? abs_amount / results.total_tests
+      : 0;
+    rows.push([
+      `${emoji} ${resultType}`,
+      `${abs_amount} (${(rel_amount * 100).toFixed(1)}%)`,
+    ]);
+  }
+  gha.summary.addTable(rows);
 }
 
 function addDetailsWithCodeBlock(summary, label, code) {
@@ -7756,16 +8241,26 @@ async function entrypoint() {
 }
 
 function getInputs() {
+  const files = gha.getMultilineInput("files", { required: true });
+
   return {
-    path: gha.getInput("path", { required: true }),
+    files: files,
     summary: gha.getBooleanInput("summary", {
       required: false,
     }),
-    displayOptions: gha.getInput("display-options", { required: false }),
     failOnEmpty: gha.getBooleanInput("fail-on-empty", {
       required: false,
     }),
     title: gha.getInput("title", { required: false }),
+    metadataFields: gha.getInput("metadata-fields", { required: false }),
+    metadataFieldMapping: gha.getInput("metadata-field-mapping", {
+      required: false,
+    }),
+    resultTypes: gha.getInput("result-types", { required: false }),
+    details: gha.getBooleanInput("details", { required: false }),
+    detailsResultTypes: gha.getInput("details-result-types", {
+      required: false,
+    }),
   };
 }
 

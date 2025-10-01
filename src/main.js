@@ -6,7 +6,10 @@ const { parseXmlFiles } = require("./io");
 const { postResults } = require("./results");
 
 async function main(inputs) {
-  var xmls = parseXmlFiles(inputs.path);
+  // Use files input
+  const paths = inputs.files;
+
+  var xmls = parseXmlFiles(paths);
 
   const { isEmpty, generator } = await checkAsyncGeneratorEmpty(xmls);
   if (isEmpty && inputs.failOnEmpty) {
@@ -16,5 +19,14 @@ async function main(inputs) {
   }
   xmls = generator;
 
-  await postResults(xmls, inputs);
+  await postResults(
+    xmls,
+    inputs.title,
+    inputs.summary,
+    inputs.metadataFields,
+    inputs.metadataFieldMapping,
+    inputs.resultTypes,
+    inputs.details,
+    inputs.detailsResultTypes
+  );
 }

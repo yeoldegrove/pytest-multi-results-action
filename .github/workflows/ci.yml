@@ -74,13 +74,35 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-env
 
-      - name: Setup pytest
-        run: uv pip install pytest
-
       - name: Run tests
-        run: uv run pytest --junit-xml=test-results.xml || true
+        run: |
+          npm run test
+          npm run test-metadata
 
-      - name: Summarize test results
+      - name: Generate Test Report
         uses: ./
+        if: always()
         with:
-          path: test-results.xml
+          files: |
+            test-data/*.xml
+          title: "Test Results"
+          summary: true
+          details: true
+          result-types: "passed,skipped,xfailed,failed,xpassed,error"
+          details-result-types: "passed,skipped,xfailed,failed,xpassed,error"
+          fail-on-empty: false
+
+      - name: Generate Test Report with Metadata
+        uses: ./
+        if: always()
+        with:
+          files: |
+            test-data/*.xml
+          title: "Test Results with Metadata"
+          summary: true
+          details: true
+          result-types: "passed,skipped,xfailed,failed,xpassed,error"
+          details-result-types: "passed,skipped,xfailed,failed,xpassed,error"
+          fail-on-empty: false
+          metadata-fields: "Artifact,Type,Namespace"
+          metadata-field-mapping: '{"Namespace": "Namespace", "Type": "Type", "Artifact": "Artifact"}'
