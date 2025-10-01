@@ -1,4 +1,4 @@
-name: pytest-results-actions
+name: pytest-multi-results-action
 description: Post pytest results to the workflow summary
 
 branding:
@@ -10,10 +10,11 @@ runs:
   main: dist/index.js
 
 inputs:
-  path:
+  files:
     description: |
-      A list of JUnit XML files, directories containing the former, and wildcard 
-      patterns to process. See @actions/glob for supported patterns.
+      Multiple JUnit XML file patterns for multi-suite aggregation.
+      Each pattern can be a file, directory, or wildcard pattern.
+      See @actions/glob for supported patterns.
     required: true
   summary:
     description: Add a summary of the results at the top of the report
@@ -21,7 +22,7 @@ inputs:
     default: true
   display-options:
     description: |
-      Select which results should be included in the report. 
+      Select which results should be included in the report.
       Follows the same syntax as `pytest -r`
     required: false
     default: fEX
@@ -33,3 +34,17 @@ inputs:
     description: Title of the test results section in the workflow summary
     required: false
     default: Test results
+  metadata-fields:
+    description: |
+      Comma-separated list of metadata fields to extract from XML and display in tables.
+      Supports pytest-metadata properties and custom XML attributes.
+      If not provided, defaults to "Suite" column.
+      Example: "artifact,type,namespace"
+    required: false
+    default: ""
+  metadata-field-mapping:
+    description: |
+      JSON object mapping XML attribute/property names to display names.
+      Example: '{"artifact": "Artifact", "type": "Type", "namespace": "Namespace"}'
+    required: false
+    default: "{}"

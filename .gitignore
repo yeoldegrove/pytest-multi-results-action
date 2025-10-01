@@ -7,3 +7,9 @@ __pycache__/
 
 # IDE
 .idea
+
+# Test Outputs
+test-output/
+
+# direnv
+.envrc
