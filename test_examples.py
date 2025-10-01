@@ -1,5 +1,6 @@
 import pytest
 
+pytestmark = pytest.mark.usefixtures('include_metadata_in_junit_xml')
 
 def test_success():
     assert True

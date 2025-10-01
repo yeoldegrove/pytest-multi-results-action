@@ -7,3 +7,10 @@ __pycache__/
 
 # IDE
 .idea
+
+# Test Date and Outputs
+test-data/
+test-metadata-data/
+
+# direnv
+.envrc
